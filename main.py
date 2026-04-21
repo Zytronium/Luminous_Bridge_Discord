@@ -10,7 +10,7 @@ sender's display name instead of the bot's).
 Requirements
 ------------
 - Python 3.11+ (uses `X | Y` union types and `match`) (prefer 3.14+)
-- pip install discord.py aiohttp python-dotenv
+- pip install discord.py aiohttp python-dotenv supabase
 - A Luminous bot account
 - One Discord webhook per bridged channel (Server Settings -> Integrations)
 
@@ -29,8 +29,8 @@ import sqlite3
 
 import aiohttp
 import discord
-from discord.ext import tasks
 from dotenv import load_dotenv
+from supabase._async.client import AsyncClient, create_client as _sb_create
 
 load_dotenv()
 
@@ -49,8 +49,11 @@ BOT_EMAIL     = os.environ["LUMINOUS_BOT_EMAIL"]
 BOT_PASSWORD  = os.environ["LUMINOUS_BOT_PASSWORD"]
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 
-# How often to poll Luminous for new/edited/deleted messages (seconds).
-POLL_INTERVAL = int(os.getenv("POLL_INTERVAL", "2"))
+# Supabase project credentials (used for Realtime subscriptions).
+# The service role key bypasses RLS. keep it secret, never expose in a browser.
+# Find it in: Supabase Dashboard -> Settings -> API -> service_role key
+SUPABASE_URL              = os.environ["SUPABASE_URL"]
+SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
 # -- Channel map ----------------------------------------------------------------
 # luminous_channel_id  ->  { discord_id (int), webhook_url (str) }
@@ -67,6 +70,8 @@ DISCORD_TO_L: dict[int, str] = {v["discord_id"]: k for k, v in BRIDGES.items()}
 
 
 # -- SQLite helpers -------------------------------------------------------------
+# Only msg_map is needed now. Supabase Realtime delivers edits and deletes
+# directly, so the polling cursor (l_cursor) and content cache (l_cache) are gone.
 DB_PATH = "bridge.db"
 
 
@@ -85,18 +90,6 @@ def init_db() -> None:
                 d_id      TEXT NOT NULL UNIQUE,   -- Discord snowflake (stored as TEXT)
                 l_channel TEXT NOT NULL,
                 d_channel TEXT NOT NULL
-            );
-
-            -- Newest Luminous message timestamp seen per channel (poll cursor)
-            CREATE TABLE IF NOT EXISTS l_cursor (
-                channel_id      TEXT PRIMARY KEY,
-                last_created_at TEXT NOT NULL
-            );
-
-            -- Content cache for Luminous messages (edit / delete detection)
-            CREATE TABLE IF NOT EXISTS l_cache (
-                l_id    TEXT PRIMARY KEY,
-                content TEXT NOT NULL
             );
         """)
     log.info("SQLite bridge.db ready.")
@@ -124,45 +117,6 @@ def map_set(l_id: str, d_id: int | str, l_channel: str, d_channel: int | str) ->
             "INSERT OR IGNORE INTO msg_map VALUES (?,?,?,?)",
             (l_id, str(d_id), l_channel, str(d_channel)),
         )
-
-
-# l_cursor -----------------------------------------------------------------
-
-def cursor_get(channel_id: str) -> str | None:
-    with _db() as c:
-        r = c.execute(
-            "SELECT last_created_at FROM l_cursor WHERE channel_id=?", (channel_id,)
-        ).fetchone()
-    return r["last_created_at"] if r else None
-
-
-def cursor_set(channel_id: str, ts: str) -> None:
-    with _db() as c:
-        c.execute("INSERT OR REPLACE INTO l_cursor VALUES (?,?)", (channel_id, ts))
-
-
-# l_cache ------------------------------------------------------------------
-
-def cache_set(l_id: str, content: str) -> None:
-    with _db() as c:
-        c.execute("INSERT OR REPLACE INTO l_cache VALUES (?,?)", (l_id, content))
-
-
-def cache_get(l_id: str) -> str | None:
-    with _db() as c:
-        r = c.execute("SELECT content FROM l_cache WHERE l_id=?", (l_id,)).fetchone()
-    return r["content"] if r else None
-
-
-def cache_delete(l_id: str) -> None:
-    with _db() as c:
-        c.execute("DELETE FROM l_cache WHERE l_id=?", (l_id,))
-
-
-def cache_all_ids() -> set[str]:
-    with _db() as c:
-        rows = c.execute("SELECT l_id FROM l_cache").fetchall()
-    return {r["l_id"] for r in rows}
 
 
 # -- Luminous API client --------------------------------------------------------
@@ -249,24 +203,6 @@ class LuminousClient:
                 return await self.delete(message_id)
             return r.status in (200, 404)
 
-    async def fetch_recent(self, channel_id: str, count: int = 100) -> list[dict]:
-        """
-        Fetch the most recent `count` messages for a channel, oldest-first.
-        The Luminous API returns ascending order after the internal .reverse().
-        """
-        async with self._session.get(
-            f"{LUMINOUS_API}/api/channels/{channel_id}/messages",
-            headers=self._h,
-            params={"count": count},
-        ) as r:
-            if r.status == 401:
-                await self._login()
-                return await self.fetch_recent(channel_id, count)
-            if r.status != 200:
-                log.warning("fetch_recent %s returned %s", channel_id, r.status)
-                return []
-            return await r.json()
-
 
 # -- Discord webhook helpers ----------------------------------------------------
 
@@ -328,15 +264,18 @@ class BridgeBot(discord.Client):
         super().__init__(intents=intents)
         self.lm = luminous
         self._http: aiohttp.ClientSession | None = None
+        self._supabase: AsyncClient | None = None
+        self._profile_cache: dict[str, str] = {}   # user_id -> display_name
 
     # -- Lifecycle -------------------------------------------------------------
 
     async def setup_hook(self) -> None:
         self._http = aiohttp.ClientSession()
-        self.poll_luminous.start()
+        asyncio.create_task(self._start_realtime())
 
     async def close(self) -> None:
-        self.poll_luminous.cancel()
+        if self._supabase:
+            await self._supabase.realtime.disconnect()
         if self._http:
             await self._http.close()
         await self.lm.close()
@@ -345,6 +284,163 @@ class BridgeBot(discord.Client):
     async def on_ready(self) -> None:
         log.info("Discord bot ready: %s (id=%s)", self.user, self.user.id)
         log.info("Bridging %d channel(s).", len(BRIDGES))
+
+    # -- Supabase Realtime: Luminous -> Discord --------------------------------
+
+    async def _start_realtime(self) -> None:
+        """
+        Subscribe to postgres_changes on the messages table for each bridged
+        channel. Mirrors the supabase.channel().on("postgres_changes", ...) calls
+        in page.tsx, listening for INSERT / UPDATE / DELETE.
+
+        Supabase Realtime payload structure (python supabase-py v2):
+          INSERT/UPDATE → payload["record"]      contains the new row
+          UPDATE        → payload["old_record"]  contains the previous row
+          DELETE        → payload["old_record"]  contains the deleted row
+
+        If the shape ever differs, log payload at DEBUG level and adjust the
+        key lookups in the three handlers below.
+        """
+        await self.wait_until_ready()
+
+        self._supabase = await _sb_create(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+        for l_channel, bridge in BRIDGES.items():
+            # Capture loop variables for closures.
+            lc = l_channel
+            br = bridge
+
+            rt_channel = self._supabase.channel(f"bridge:{lc}")
+
+            # supabase-py invokes these callbacks synchronously and never awaits
+            # the return value, so async def silently creates a coroutine that is
+            # immediately discarded. Use plain def + create_task instead.
+            def on_insert(payload: dict, lc=lc, br=br) -> None:
+                log.debug("Realtime INSERT: %s", payload)
+                data: dict = payload.get("data") or {}
+                record: dict = payload.get("record") or payload.get("new") or data.get("record") or data.get("new") or {}
+                if not record:
+                    log.warning("INSERT payload missing record: %s", payload)
+                    return
+                asyncio.create_task(self._on_l_insert(lc, br, record))
+
+            def on_update(payload: dict, lc=lc, br=br) -> None:
+                log.debug("Realtime UPDATE: %s", payload)
+                data: dict = payload.get("data") or {}
+                record: dict = payload.get("record") or payload.get("new") or data.get("record") or data.get("new") or {}
+                if not record:
+                    log.warning("UPDATE payload missing record: %s", payload)
+                    return
+                asyncio.create_task(self._on_l_update(lc, br, record))
+
+            def on_delete(payload: dict, lc=lc, br=br) -> None:
+                log.debug("Realtime DELETE: %s", payload)
+                data: dict = payload.get("data") or {}
+                old: dict = payload.get("old_record") or payload.get("old") or data.get("old_record") or data.get("old") or {}
+                if not old:
+                    log.warning("DELETE payload missing old_record: %s", payload)
+                    return
+                asyncio.create_task(self._on_l_delete(lc, br, old))
+
+            (
+                rt_channel
+                .on_postgres_changes(
+                    event="INSERT",
+                    schema="public",
+                    table="messages",
+                    filter=f"channel_id=eq.{lc}",
+                    callback=on_insert,
+                )
+                .on_postgres_changes(
+                    event="UPDATE",
+                    schema="public",
+                    table="messages",
+                    filter=f"channel_id=eq.{lc}",
+                    callback=on_update,
+                )
+                .on_postgres_changes(
+                    event="DELETE",
+                    schema="public",
+                    table="messages",
+                    filter=f"channel_id=eq.{lc}",
+                    callback=on_delete,
+                )
+            )
+            await rt_channel.subscribe()
+            log.info("Subscribed to Supabase Realtime for channel '%s'.", lc)
+
+        # Hold the task open; the realtime client runs on its own internal loop.
+        await asyncio.get_event_loop().run_in_executor(None, lambda: None)
+        await asyncio.Event().wait()
+
+    async def _get_display_name(self, user_id: str) -> str:
+        """Fetch a user's display_name from the profiles table, falling back gracefully."""
+        if user_id in self._profile_cache:
+            return self._profile_cache[user_id]
+        try:
+            resp = (
+                await self._supabase
+                .table("profiles")
+                .select("display_name")
+                .eq("id", user_id)
+                .single()
+                .execute()
+            )
+            name = (resp.data or {}).get("display_name") or "Unknown Luminous User"
+        except Exception as exc:
+            log.warning("Could not fetch display_name for user %s: %s", user_id, exc)
+            name = "Unknown Luminous User"
+        self._profile_cache[user_id] = name
+        return name
+
+    async def _on_l_insert(self, l_channel: str, bridge: dict, record: dict) -> None:
+        """Relay a new Luminous message to Discord."""
+        l_id: str = record.get("id", "")
+
+        # Skip messages this bot sent (Discord -> Luminous relay) to prevent loops.
+        if record.get("user_id") == self.lm.bot_user_id:
+            log.debug("L->D [new] skipping own message luminous=%s", l_id)
+            return
+
+        webhook_url: str  = bridge["webhook_url"]
+        d_channel_id: int = bridge["discord_id"]
+
+        username: str = await self._get_display_name(record.get("user_id", ""))
+        content: str  = record.get("content", "")
+
+        d_id = await webhook_post(self._http, webhook_url, username, content)
+        if d_id:
+            map_set(l_id, d_id, l_channel, d_channel_id)
+            log.info("L->D [new] luminous=%s discord=%s", l_id, d_id)
+        else:
+            log.warning("L->D [new] webhook_post failed for luminous=%s", l_id)
+
+    async def _on_l_update(self, l_channel: str, bridge: dict, record: dict) -> None:
+        """Relay a Luminous message edit to Discord."""
+        l_id: str      = record.get("id", "")
+        new_content: str = record.get("content", "")
+
+        d_id = map_get_d(l_id)
+        if not d_id:
+            log.debug("L->D [edit] no Discord mapping for luminous=%s", l_id)
+            return
+
+        ok = await webhook_edit(self._http, bridge["webhook_url"], d_id, new_content)
+        log.info("L->D [edit] luminous=%s discord=%s ok=%s", l_id, d_id, ok)
+
+    async def _on_l_delete(self, l_channel: str, bridge: dict, old: dict) -> None:
+        """Relay a Luminous message deletion to Discord."""
+        l_id: str = old.get("id", "")
+        if not l_id:
+            return
+
+        d_id = map_get_d(l_id)
+        if not d_id:
+            log.debug("L->D [delete] no Discord mapping for luminous=%s", l_id)
+            return
+
+        ok = await webhook_delete(self._http, bridge["webhook_url"], d_id)
+        log.info("L->D [delete] luminous=%s discord=%s ok=%s", l_id, d_id, ok)
 
     # -- Discord -> Luminous: new messages --------------------------------------
 
@@ -365,7 +461,6 @@ class BridgeBot(discord.Client):
         l_id = await self.lm.send(l_channel, content)
         if l_id:
             map_set(l_id, msg.id, l_channel, msg.channel.id)
-            cache_set(l_id, content)
             log.info("D->L [new] discord=%s luminous=%s", msg.id, l_id)
         else:
             log.warning(
@@ -392,8 +487,6 @@ class BridgeBot(discord.Client):
         new_content = f"**[Discord] {name}**:\n{after.content}"
 
         ok = await self.lm.edit(l_id, new_content)
-        if ok:
-            cache_set(l_id, new_content)   # Keep cache in sync
         log.info("D->L [edit] discord=%s luminous=%s ok=%s", after.id, l_id, ok)
 
     # -- Discord -> Luminous: deletes -------------------------------------------
@@ -409,102 +502,7 @@ class BridgeBot(discord.Client):
             return
 
         ok = await self.lm.delete(l_id)
-        if ok:
-            cache_delete(l_id)
         log.info("D->L [delete] discord=%s luminous=%s ok=%s", msg.id, l_id, ok)
-
-    # -- Luminous -> Discord: polling -------------------------------------------
-
-    @tasks.loop(seconds=POLL_INTERVAL)
-    async def poll_luminous(self) -> None:
-        for l_channel, bridge in BRIDGES.items():
-            try:
-                await self._poll_channel(l_channel, bridge)
-            except Exception:
-                log.exception("Unhandled error polling channel %s", l_channel)
-
-    @poll_luminous.before_loop
-    async def _before_poll(self) -> None:
-        await self.wait_until_ready()
-        log.info("Luminous poller started (interval=%ds).", POLL_INTERVAL)
-
-    async def _poll_channel(self, l_channel: str, bridge: dict) -> None:
-        messages: list[dict] = await self.lm.fetch_recent(l_channel, count=100)
-        if not messages:
-            return
-
-        webhook_url: str   = bridge["webhook_url"]
-        d_channel_id: int  = bridge["discord_id"]
-
-        # -- First run: anchor cursor, seed cache, do not replay history -------
-        if cursor_get(l_channel) is None:
-            newest_ts = messages[-1]["created_at"]
-            cursor_set(l_channel, newest_ts)
-            for m in messages:
-                cache_set(m["id"], m["content"])
-            log.info("L->D [init] channel=%s anchored at %s", l_channel, newest_ts)
-            return
-
-        last_seen: str = cursor_get(l_channel)  # type: ignore[assignment]
-
-        # Separate new messages from the already-seen window
-        new_msgs    = [m for m in messages if m["created_at"] > last_seen]
-        window_msgs = [m for m in messages if m["created_at"] <= last_seen]
-        fetched_ids = {m["id"] for m in messages}
-        cached_ids  = cache_all_ids()
-
-        # -- Edit detection: content changed for a cached message ---------------
-        for m in window_msgs:
-            l_id = m["id"]
-            if l_id not in cached_ids:
-                continue
-            cached = cache_get(l_id)
-            if cached is not None and m["content"] != cached:
-                await self._relay_l_edit(l_id, m["content"], webhook_url)
-                cache_set(l_id, m["content"])
-
-        # -- Delete detection: cached ID no longer in the 100-msg fetch window --
-        # Note: IDs can also fall out of the window naturally as newer messages
-        # push them out. We only treat it as a delete if we have a Discord mapping
-        # (i.e. we bridged that message), and only for messages older than our
-        # anchor point (to avoid false positives on start-up).
-        for l_id in list(cached_ids):
-            if l_id not in fetched_ids:
-                d_id = map_get_d(l_id)
-                if d_id:
-                    await self._relay_l_delete(l_id, d_id, webhook_url)
-                cache_delete(l_id)
-
-        # -- Relay new messages to Discord --------------------------------------
-        for m in new_msgs:
-            l_id = m["id"]
-
-            # Skip messages the bot itself sent (Discord->Luminous relay) to
-            # prevent the message bouncing back.
-            if m.get("user_id") == self.lm.bot_user_id:
-                cache_set(l_id, m["content"])   # Still cache for edit detection
-                continue
-
-            username = m.get("profiles", {}).get("display_name") or "Luminous User"
-            d_id = await webhook_post(self._http, webhook_url, username, m["content"])
-            if d_id:
-                map_set(l_id, d_id, l_channel, d_channel_id)
-                log.info("L->D [new] luminous=%s discord=%s", l_id, d_id)
-            cache_set(l_id, m["content"])
-
-        if new_msgs:
-            cursor_set(l_channel, new_msgs[-1]["created_at"])
-
-    async def _relay_l_edit(self, l_id: str, new_content: str, webhook_url: str) -> None:
-        d_id = map_get_d(l_id)
-        if not d_id:
-            return
-        ok = await webhook_edit(self._http, webhook_url, d_id, new_content)
-        log.info("L->D [edit] luminous=%s discord=%s ok=%s", l_id, d_id, ok)
-
-    async def _relay_l_delete(self, l_id: str, d_id: str, webhook_url: str) -> None:
-        ok = await webhook_delete(self._http, webhook_url, d_id)
-        log.info("L->D [delete] luminous=%s discord=%s ok=%s", l_id, d_id, ok)
 
 
 # -- Entry point ----------------------------------------------------------------

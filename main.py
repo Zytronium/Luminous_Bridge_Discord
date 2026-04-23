@@ -266,16 +266,26 @@ class BridgeBot(discord.Client):
         self._http: aiohttp.ClientSession | None = None
         self._supabase: AsyncClient | None = None
         self._profile_cache: dict[str, str] = {}   # user_id -> display_name
+        self._realtime_task: asyncio.Task | None = None
 
     # -- Lifecycle -------------------------------------------------------------
 
     async def setup_hook(self) -> None:
         self._http = aiohttp.ClientSession()
-        asyncio.create_task(self._start_realtime())
+        self._realtime_task = asyncio.create_task(self._start_realtime())
 
     async def close(self) -> None:
+        if self._realtime_task and not self._realtime_task.done():
+            self._realtime_task.cancel()
+            try:
+                await self._realtime_task
+            except asyncio.CancelledError:
+                pass
         if self._supabase:
-            await self._supabase.realtime.disconnect()
+            try:
+                await self._supabase.realtime.disconnect()
+            except Exception:
+                pass
         if self._http:
             await self._http.close()
         await self.lm.close()
@@ -289,6 +299,47 @@ class BridgeBot(discord.Client):
 
     async def _start_realtime(self) -> None:
         """
+        Outer reconnect loop for the Supabase Realtime subscription.
+
+        Supabase will silently drop the WebSocket after inactivity or on
+        transient network issues.  This loop detects that via a watchdog inside
+        _realtime_session() and re-establishes the full subscription set with
+        exponential back-off (5 s → 10 s → … → 60 s, reset after a healthy run).
+        """
+        await self.wait_until_ready()
+        backoff = 5
+        session_start: float = 0.0
+
+        while not self.is_closed():
+            try:
+                session_start = asyncio.get_event_loop().time()
+                await self._realtime_session()
+            except asyncio.CancelledError:
+                return
+            except Exception as exc:
+                log.error("Realtime session ended: %s", exc)
+            finally:
+                # Always tear down the old client before reconnecting.
+                if self._supabase:
+                    try:
+                        await self._supabase.realtime.disconnect()
+                    except Exception:
+                        pass
+                    self._supabase = None
+
+            if self.is_closed():
+                return
+
+            # Reset back-off if the last session lived long enough to be healthy.
+            if asyncio.get_event_loop().time() - session_start > 60:
+                backoff = 5
+
+            log.info("Realtime: reconnecting in %d s …", backoff)
+            await asyncio.sleep(backoff)
+            backoff = min(backoff * 2, 60)
+
+    async def _realtime_session(self) -> None:
+        """
         Subscribe to postgres_changes on the messages table for each bridged
         channel. Mirrors the supabase.channel().on("postgres_changes", ...) calls
         in page.tsx, listening for INSERT / UPDATE / DELETE.
@@ -300,9 +351,10 @@ class BridgeBot(discord.Client):
 
         If the shape ever differs, log payload at DEBUG level and adjust the
         key lookups in the three handlers below.
-        """
-        await self.wait_until_ready()
 
+        Raises ConnectionError (caught by _start_realtime) when the watchdog
+        detects the WebSocket has dropped silently.
+        """
         self._supabase = await _sb_create(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
 
         for l_channel, bridge in BRIDGES.items():
@@ -369,9 +421,19 @@ class BridgeBot(discord.Client):
             await rt_channel.subscribe()
             log.info("Subscribed to Supabase Realtime for channel '%s'.", lc)
 
-        # Hold the task open; the realtime client runs on its own internal loop.
-        await asyncio.get_event_loop().run_in_executor(None, lambda: None)
-        await asyncio.Event().wait()
+        # Watchdog: poll the WebSocket state every 30 s.
+        # is_connected() reflects the underlying ws_connection status in
+        # realtime-py; if it goes False the socket has dropped silently and we
+        # need to tear down and re-subscribe from scratch.
+        POLL_INTERVAL = 30
+        while True:
+            await asyncio.sleep(POLL_INTERVAL)
+            try:
+                connected: bool = self._supabase.realtime.is_connected()
+            except Exception as exc:
+                raise ConnectionError(f"Realtime health-check raised: {exc}") from exc
+            if not connected:
+                raise ConnectionError("Realtime WebSocket dropped (is_connected=False).")
 
     async def _get_display_name(self, user_id: str) -> str:
         """Fetch a user's display_name from the profiles table, falling back gracefully."""

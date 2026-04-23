@@ -23,6 +23,7 @@ Usage
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timezone
 import logging
 import os
 import sqlite3
@@ -267,6 +268,7 @@ class BridgeBot(discord.Client):
         self._supabase: AsyncClient | None = None
         self._profile_cache: dict[str, str] = {}   # user_id -> display_name
         self._realtime_task: asyncio.Task | None = None
+        self._last_session_end: datetime | None = None  # UTC; used for catch-up on reconnect
 
     # -- Lifecycle -------------------------------------------------------------
 
@@ -323,6 +325,9 @@ class BridgeBot(discord.Client):
             except Exception as exc:
                 log.error("Realtime session ended: %s", exc)
             finally:
+                # Stamp the end time *before* teardown so the catch-up query
+                # in the next session knows exactly where the gap starts.
+                self._last_session_end = datetime.now(timezone.utc)
                 # Always tear down the old client before reconnecting.
                 # remove_all_channels() must come first — it sends Unsubscribe
                 # frames to Supabase so the server drops the postgres_changes
@@ -434,19 +439,54 @@ class BridgeBot(discord.Client):
             await rt_channel.subscribe()
             log.info("Subscribed to Supabase Realtime for channel '%s'.", lc)
 
+        # Catch-up: relay any messages sent while we were disconnected.
+        # We subscribe first (above) so we don't miss anything at the seam;
+        # _on_l_insert is idempotent (checks map_get_d), so an event that
+        # arrives via both Realtime and the catch-up query is safely deduplicated.
+        if self._last_session_end is not None:
+            await self._catchup_missed(self._last_session_end)
+
         # Watchdog: poll the WebSocket state every 30 s.
-        # is_connected() reflects the underlying ws_connection status in
-        # realtime-py; if it goes False the socket has dropped silently and we
-        # need to tear down and re-subscribe from scratch.
+        # with (), that raises "bool object is not callable" which the except
+        # clause was (incorrectly) treating as a dead-connection signal.
         POLL_INTERVAL = 30
         while True:
             await asyncio.sleep(POLL_INTERVAL)
-            try:
-                connected: bool = self._supabase.realtime.is_connected()
-            except Exception as exc:
-                raise ConnectionError(f"Realtime health-check raised: {exc}") from exc
+            connected: bool = self._supabase.realtime.is_connected
             if not connected:
                 raise ConnectionError("Realtime WebSocket dropped (is_connected=False).")
+
+    async def _catchup_missed(self, since: datetime) -> None:
+        """
+        Relay any Luminous messages sent while the Realtime socket was down.
+
+        This is a single targeted query per bridged channel, run once on
+        reconnect — not polling.  We subscribe to Realtime *before* calling
+        this so there's no gap at the trailing edge; _on_l_insert deduplicates
+        anything that arrives via both paths.
+        """
+        since_iso = since.isoformat()
+        for lc, br in BRIDGES.items():
+            try:
+                resp = (
+                    await self._supabase
+                    .table("messages")
+                    .select("*")
+                    .eq("channel_id", lc)
+                    .gt("created_at", since_iso)
+                    .order("created_at")
+                    .execute()
+                )
+                rows: list[dict] = resp.data or []
+                if rows:
+                    log.info(
+                        "Catch-up: relaying %d missed message(s) for channel '%s'.",
+                        len(rows), lc,
+                    )
+                for record in rows:
+                    await self._on_l_insert(lc, br, record)
+            except Exception as exc:
+                log.warning("Catch-up query failed for channel '%s': %s", lc, exc)
 
     async def _get_display_name(self, user_id: str) -> str:
         """Fetch a user's display_name from the profiles table, falling back gracefully."""
@@ -475,6 +515,11 @@ class BridgeBot(discord.Client):
         # Skip messages this bot sent (Discord -> Luminous relay) to prevent loops.
         if record.get("user_id") == self.lm.bot_user_id:
             log.debug("L->D [new] skipping own message luminous=%s", l_id)
+            return
+
+        # Idempotency: already relayed (e.g. arrived via both Realtime and catch-up).
+        if map_get_d(l_id):
+            log.debug("L->D [new] skipping already-relayed luminous=%s", l_id)
             return
 
         webhook_url: str  = bridge["webhook_url"]

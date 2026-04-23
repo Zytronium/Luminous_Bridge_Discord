@@ -283,6 +283,10 @@ class BridgeBot(discord.Client):
                 pass
         if self._supabase:
             try:
+                await self._supabase.remove_all_channels()
+            except Exception:
+                pass
+            try:
                 await self._supabase.realtime.disconnect()
             except Exception:
                 pass
@@ -320,7 +324,16 @@ class BridgeBot(discord.Client):
                 log.error("Realtime session ended: %s", exc)
             finally:
                 # Always tear down the old client before reconnecting.
+                # remove_all_channels() must come first — it sends Unsubscribe
+                # frames to Supabase so the server drops the postgres_changes
+                # listeners.  Skipping this causes duplicate deliveries on
+                # reconnect because the old subscription stays alive server-side
+                # and the new one stacks on top of it.
                 if self._supabase:
+                    try:
+                        await self._supabase.remove_all_channels()
+                    except Exception:
+                        pass
                     try:
                         await self._supabase.realtime.disconnect()
                     except Exception:

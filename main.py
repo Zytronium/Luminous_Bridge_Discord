@@ -60,7 +60,7 @@ SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 # Add more entries here as you bridge more channels.
 BRIDGES: dict[str, dict] = {
     "cross-platform-test": {
-        "discord_id":  1489740468353765571,
+        "discord_id":  1496598643753484359,
         "webhook_url": os.environ["DISCORD_WEBHOOK_CROSS_PLATFORM_TEST"],
     },
 }

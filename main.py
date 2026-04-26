@@ -446,12 +446,22 @@ class BridgeBot(discord.Client):
         if self._last_session_end is not None:
             await self._catchup_missed(self._last_session_end)
 
-        # Watchdog: poll the WebSocket state every 30 s.
-        # with (), that raises "bool object is not callable" which the except
-        # clause was (incorrectly) treating as a dead-connection signal.
+        # Watchdog: poll the WebSocket state every 30 s and proactively
+        # reconnect before the Supabase JWT expires (~1 h).  Waiting for
+        # the channel to close on its own (code 1006 / "Token has expired")
+        # leaves a dead subscription that misses messages; cycling the client
+        # 10 minutes early avoids the gap entirely.
+        MAX_SESSION_SECONDS = 50 * 60   # 50 min - well under the 1-hour JWT TTL
         POLL_INTERVAL = 30
+        session_deadline = asyncio.get_event_loop().time() + MAX_SESSION_SECONDS
         while True:
             await asyncio.sleep(POLL_INTERVAL)
+
+            # Proactive reconnect: rebuild the client (and its JWT) before expiry.
+            if asyncio.get_event_loop().time() >= session_deadline:
+                log.info("Realtime: proactive reconnect to refresh JWT.")
+                raise ConnectionError("Proactive Realtime reconnect: approaching JWT expiry.")
+
             connected: bool = self._supabase.realtime.is_connected
             if not connected:
                 raise ConnectionError("Realtime WebSocket dropped (is_connected=False).")

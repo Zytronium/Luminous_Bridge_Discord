@@ -7,12 +7,16 @@ real-time. Discord messages are relayed to Luminous via the REST API; Luminous
 messages are relayed to Discord via per-channel webhooks (so they show the
 sender's display name instead of the bot's).
 
+On startup the bot discovers every text channel in the Discord guild, ensures
+a matching Luminous channel exists (creating one if needed), and provisions
+webhooks automatically - no manual configuration per channel is required.
+
 Requirements
 ------------
 - Python 3.11+ (uses `X | Y` union types and `match`) (prefer 3.14+)
 - pip install discord.py aiohttp python-dotenv supabase
 - A Luminous bot account
-- One Discord webhook per bridged channel (Server Settings -> Integrations)
+- The Discord bot must have the Manage Webhooks permission in all channels
 
 Usage
 -----
@@ -49,6 +53,9 @@ LUMINOUS_API  = os.environ["LUMINOUS_API_URL"].rstrip("/")
 BOT_EMAIL     = os.environ["LUMINOUS_BOT_EMAIL"]
 BOT_PASSWORD  = os.environ["LUMINOUS_BOT_PASSWORD"]
 DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
+DISCORD_GUILD_ID = int(os.environ["DISCORD_GUILD_ID"])
+
+DISCORD_API = "https://discord.com/api/v10"
 
 # Supabase project credentials (used for Realtime subscriptions).
 # The service role key bypasses RLS. keep it secret, never expose in a browser.
@@ -56,23 +63,18 @@ DISCORD_TOKEN = os.environ["DISCORD_BOT_TOKEN"]
 SUPABASE_URL              = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_ROLE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-# -- Channel map ----------------------------------------------------------------
-# luminous_channel_id  ->  { discord_id (int), webhook_url (str) }
-# Add more entries here as you bridge more channels.
-BRIDGES: dict[str, dict] = {
-    "cross-platform-test": {
-        "discord_id":  1496598643753484359,
-        "webhook_url": os.environ["DISCORD_WEBHOOK_CROSS_PLATFORM_TEST"],
-    },
-}
-
-# Reverse lookup:  discord_channel_id (int)  ->  luminous_channel_id
-DISCORD_TO_L: dict[int, str] = {v["discord_id"]: k for k, v in BRIDGES.items()}
+# -- Channel maps ---------------------------------------------------------------
+# Both dicts are empty at import time and populated by BridgeBot.sync_channels()
+# once the Discord gateway is ready. Nothing should read them before on_ready
+# has fired and _channels_ready is set.
+#
+#   BRIDGES:      luminous_channel_id  ->  { discord_id (int) }
+#   DISCORD_TO_L: discord_channel_id (int)  ->  luminous_channel_id
+BRIDGES: dict[str, dict] = {}
+DISCORD_TO_L: dict[int, str] = {}
 
 
 # -- SQLite helpers -------------------------------------------------------------
-# Only msg_map is needed now. Supabase Realtime delivers edits and deletes
-# directly, so the polling cursor (l_cursor) and content cache (l_cache) are gone.
 DB_PATH = "bridge.db"
 
 
@@ -92,11 +94,25 @@ def init_db() -> None:
                 l_channel TEXT NOT NULL,
                 d_channel TEXT NOT NULL
             );
+
+            -- Webhook URLs discovered or created per Discord channel at startup.
+            -- Avoids a Discord API call on every relayed message.
+            CREATE TABLE IF NOT EXISTS webhooks (
+                d_channel_id TEXT PRIMARY KEY,
+                webhook_url  TEXT NOT NULL
+            );
+
+            -- Discord channel ID <-> Luminous channel ID mapping.
+            -- Persisted so the bot skips re-discovery on restart.
+            CREATE TABLE IF NOT EXISTS channel_map (
+                d_channel_id TEXT PRIMARY KEY,
+                l_channel_id TEXT NOT NULL
+            );
         """)
     log.info("SQLite bridge.db ready.")
 
 
-# msg_map ------------------------------------------------------------------
+# -- msg_map helpers ------------------------------------------------------------
 
 def map_get_d(l_id: str) -> str | None:
     """Return Discord ID for a given Luminous message ID."""
@@ -117,6 +133,44 @@ def map_set(l_id: str, d_id: int | str, l_channel: str, d_channel: int | str) ->
         c.execute(
             "INSERT OR IGNORE INTO msg_map VALUES (?,?,?,?)",
             (l_id, str(d_id), l_channel, str(d_channel)),
+        )
+
+
+# -- webhooks helpers -----------------------------------------------------------
+
+def webhook_get(d_channel_id: int | str) -> str | None:
+    with _db() as c:
+        r = c.execute(
+            "SELECT webhook_url FROM webhooks WHERE d_channel_id=?",
+            (str(d_channel_id),),
+        ).fetchone()
+    return r["webhook_url"] if r else None
+
+
+def webhook_set(d_channel_id: int | str, url: str) -> None:
+    with _db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO webhooks (d_channel_id, webhook_url) VALUES (?,?)",
+            (str(d_channel_id), url),
+        )
+
+
+# -- channel_map helpers --------------------------------------------------------
+
+def channel_map_get(d_channel_id: int | str) -> str | None:
+    with _db() as c:
+        r = c.execute(
+            "SELECT l_channel_id FROM channel_map WHERE d_channel_id=?",
+            (str(d_channel_id),),
+        ).fetchone()
+    return r["l_channel_id"] if r else None
+
+
+def channel_map_set(d_channel_id: int | str, l_channel_id: str) -> None:
+    with _db() as c:
+        c.execute(
+            "INSERT OR REPLACE INTO channel_map (d_channel_id, l_channel_id) VALUES (?,?)",
+            (str(d_channel_id), l_channel_id),
         )
 
 
@@ -158,7 +212,41 @@ class LuminousClient:
     def _h(self) -> dict:
         return {"Authorization": f"Bearer {self._token}"}
 
-    # -- Public methods -------------------------------------------------------
+    # -- Channel methods -------------------------------------------------------
+
+    async def list_channels(self) -> list[dict]:
+        """Return all channels from the Luminous API."""
+        async with self._session.get(
+            f"{LUMINOUS_API}/api/channels",
+            headers=self._h,
+        ) as r:
+            if r.status == 401:
+                await self._login()
+                return await self.list_channels()
+            if r.status == 200:
+                return await r.json()
+            log.error("Failed to list Luminous channels (%s): %s", r.status, await r.text())
+            return []
+
+    async def create_channel(self, name: str) -> dict | None:
+        """Create a channel on Luminous. Returns the created channel dict, or None on failure."""
+        async with self._session.post(
+            f"{LUMINOUS_API}/api/channel/new",
+            headers=self._h,
+            json={"name": name},
+        ) as r:
+            if r.status == 401:
+                await self._login()
+                return await self.create_channel(name)
+            if r.status in (200, 201):
+                return await r.json()
+            log.error(
+                "Failed to create Luminous channel '%s' (%s): %s",
+                name, r.status, await r.text(),
+            )
+            return None
+
+    # -- Message methods -------------------------------------------------------
 
     async def send(self, channel_id: str, content: str) -> str | None:
         """
@@ -269,6 +357,9 @@ class BridgeBot(discord.Client):
         self._profile_cache: dict[str, str] = {}   # user_id -> display_name
         self._realtime_task: asyncio.Task | None = None
         self._last_session_end: datetime | None = None  # UTC; used for catch-up on reconnect
+        # Signals _start_realtime that sync_channels() has finished and BRIDGES
+        # is fully populated. Set once in on_ready; never cleared.
+        self._channels_ready = asyncio.Event()
 
     # -- Lifecycle -------------------------------------------------------------
 
@@ -299,7 +390,138 @@ class BridgeBot(discord.Client):
 
     async def on_ready(self) -> None:
         log.info("Discord bot ready: %s (id=%s)", self.user, self.user.id)
+        await self.sync_channels()
         log.info("Bridging %d channel(s).", len(BRIDGES))
+        self._channels_ready.set()   # unblocks _start_realtime
+
+    # -- Channel discovery & provisioning -------------------------------------
+
+    async def sync_channels(self) -> None:
+        """
+        Walk every text channel in the guild, ensure a matching Luminous
+        channel exists (by name), and populate BRIDGES + DISCORD_TO_L.
+
+        Resolution order per Discord channel:
+          1. DB cache hit  → reuse stored mapping (no API calls needed)
+          2. Name match on Luminous → adopt existing channel, persist mapping
+          3. No match → create channel on Luminous, persist mapping
+
+        Webhook provisioning is deferred to the first message relayed on each
+        channel (see ensure_webhook), so this method stays fast at startup even
+        with a large number of channels.
+        """
+        guild = self.get_guild(DISCORD_GUILD_ID)
+        if not guild:
+            log.error(
+                "Guild %s not found — is the bot a member of that server?",
+                DISCORD_GUILD_ID,
+            )
+            return
+
+        # Fetch all Luminous channels once and index by name for O(1) lookup.
+        l_channels = await self.lm.list_channels()
+        l_by_id: dict[str, dict] = {ch["id"]: ch for ch in l_channels}
+
+        text_channels = [
+            ch for ch in guild.channels if isinstance(ch, discord.TextChannel)
+        ]
+        log.info("Discovered %d Discord text channel(s). Syncing...", len(text_channels))
+
+        for d_ch in text_channels:
+            # Fast path: mapping already resolved from a previous run.
+            l_channel_id = channel_map_get(d_ch.id)
+
+            if not l_channel_id:
+                l_ch = l_by_id.get(d_ch.name)
+                if l_ch:
+                    # A Luminous channel with the same name already exists.
+                    l_channel_id = str(l_ch["id"])
+                    log.info(
+                        "Matched  Discord #%s → Luminous '%s'",
+                        d_ch.name, l_channel_id,
+                    )
+                else:
+                    # No match — create the channel on Luminous.
+                    created = await self.lm.create_channel(d_ch.name)
+                    if not created:
+                        log.warning(
+                            "Skipping #%s — Luminous channel creation failed.",
+                            d_ch.name,
+                        )
+                        continue
+                    l_channel_id = str(created["id"])
+                    log.info(
+                        "Created  Discord #%s → Luminous '%s'",
+                        d_ch.name, l_channel_id,
+                    )
+
+                channel_map_set(d_ch.id, l_channel_id)
+
+            BRIDGES[l_channel_id] = {"discord_id": d_ch.id}
+            DISCORD_TO_L[d_ch.id] = l_channel_id
+
+        log.info("Bridge populated: %d channel(s) mapped.", len(BRIDGES))
+
+    async def ensure_webhook(self, d_channel_id: int) -> str | None:
+        """
+        Return a usable webhook URL for a Discord channel.
+
+        Resolution order:
+          1. SQLite cache  → return immediately (no API call)
+          2. List channel webhooks via Discord API → adopt one owned by this bot
+          3. Create a new webhook if none are found
+
+        Requires the Manage Webhooks permission in the target channel.
+        """
+        cached = webhook_get(d_channel_id)
+        if cached:
+            return cached
+
+        headers = {"Authorization": f"Bot {DISCORD_TOKEN}"}
+
+        # Try to adopt an existing webhook owned by this bot.
+        async with self._http.get(
+            f"{DISCORD_API}/channels/{d_channel_id}/webhooks",
+            headers=headers,
+        ) as r:
+            if r.status == 200:
+                hooks = await r.json()
+                bot_id = str(self.user.id)
+                # Prefer a hook this bot created; fall back to any available hook.
+                owned = [
+                    h for h in hooks
+                    if str(h.get("application_id") or h.get("user", {}).get("id", "")) == bot_id
+                ]
+                if owned:
+                    h = owned[0]
+                    url = f"https://discord.com/api/webhooks/{h['id']}/{h['token']}"
+                    webhook_set(d_channel_id, url)
+                    log.info("Webhook adopted for channel %s.", d_channel_id)
+                    return url
+            else:
+                log.warning(
+                    "Could not list webhooks for channel %s (%s).",
+                    d_channel_id, r.status,
+                )
+                return None
+
+        # No usable webhook found — create one.
+        async with self._http.post(
+            f"{DISCORD_API}/channels/{d_channel_id}/webhooks",
+            headers=headers,
+            json={"name": "Luminous Bridge"},
+        ) as r:
+            if r.status in (200, 201):
+                h = await r.json()
+                url = f"https://discord.com/api/webhooks/{h['id']}/{h['token']}"
+                webhook_set(d_channel_id, url)
+                log.info("Webhook created for channel %s.", d_channel_id)
+                return url
+            log.error(
+                "Failed to create webhook for channel %s (%s): %s",
+                d_channel_id, r.status, await r.text(),
+            )
+            return None
 
     # -- Supabase Realtime: Luminous -> Discord --------------------------------
 
@@ -313,6 +535,9 @@ class BridgeBot(discord.Client):
         exponential back-off (5 s → 10 s → … → 60 s, reset after a healthy run).
         """
         await self.wait_until_ready()
+        # Wait until on_ready has finished populating BRIDGES via sync_channels.
+        await self._channels_ready.wait()
+
         backoff = 5
         session_start: float = 0.0
 
@@ -532,8 +757,12 @@ class BridgeBot(discord.Client):
             log.debug("L->D [new] skipping already-relayed luminous=%s", l_id)
             return
 
-        webhook_url: str  = bridge["webhook_url"]
         d_channel_id: int = bridge["discord_id"]
+
+        webhook_url = await self.ensure_webhook(d_channel_id)
+        if not webhook_url:
+            log.warning("L->D [new] no webhook available for channel %s", d_channel_id)
+            return
 
         username: str = await self._get_display_name(record.get("user_id", ""))
         content: str  = record.get("content", "")
@@ -547,7 +776,7 @@ class BridgeBot(discord.Client):
 
     async def _on_l_update(self, l_channel: str, bridge: dict, record: dict) -> None:
         """Relay a Luminous message edit to Discord."""
-        l_id: str      = record.get("id", "")
+        l_id: str        = record.get("id", "")
         new_content: str = record.get("content", "")
 
         d_id = map_get_d(l_id)
@@ -555,7 +784,13 @@ class BridgeBot(discord.Client):
             log.debug("L->D [edit] no Discord mapping for luminous=%s", l_id)
             return
 
-        ok = await webhook_edit(self._http, bridge["webhook_url"], d_id, new_content)
+        d_channel_id: int = bridge["discord_id"]
+        webhook_url = await self.ensure_webhook(d_channel_id)
+        if not webhook_url:
+            log.warning("L->D [edit] no webhook available for channel %s", d_channel_id)
+            return
+
+        ok = await webhook_edit(self._http, webhook_url, d_id, new_content)
         log.info("L->D [edit] luminous=%s discord=%s ok=%s", l_id, d_id, ok)
 
     async def _on_l_delete(self, l_channel: str, bridge: dict, old: dict) -> None:
@@ -569,7 +804,13 @@ class BridgeBot(discord.Client):
             log.debug("L->D [delete] no Discord mapping for luminous=%s", l_id)
             return
 
-        ok = await webhook_delete(self._http, bridge["webhook_url"], d_id)
+        d_channel_id: int = bridge["discord_id"]
+        webhook_url = await self.ensure_webhook(d_channel_id)
+        if not webhook_url:
+            log.warning("L->D [delete] no webhook available for channel %s", d_channel_id)
+            return
+
+        ok = await webhook_delete(self._http, webhook_url, d_id)
         log.info("L->D [delete] luminous=%s discord=%s ok=%s", l_id, d_id, ok)
 
     # -- Discord -> Luminous: new messages --------------------------------------
